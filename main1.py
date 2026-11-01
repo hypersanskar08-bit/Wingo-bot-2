@@ -14,7 +14,7 @@ class Config:
     token: str = "5837138236:AAFMJPMY8SeXu0CIF-fyywY5M_u3aQm-HiI"
     chat: str = "-1004472318983"
     urls: tuple = ("https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",)
-    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v17.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v19.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
