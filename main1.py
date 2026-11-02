@@ -28,7 +28,7 @@ class Config:
     delivery_ttl: float = 55.0
     name: str = "FTW VIP PREDICTOR (HYPER)"
     # ✅ SKIP LOGIC — this is the single biggest win-rate booster
-    # 0.0 = predict every round. 0.06 = skip if confidence < 56%. 0.10 = only 60%+
+    # 0.0 = predict every round. 0.06 = skip if confidence < 50%. 0.10 = only 50%+
     min_edge: float = float(os.getenv("MIN_EDGE", "0.05"))
     # ✅ STAKE tiers based on calibrated edge, not raw confidence
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
