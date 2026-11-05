@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V17 — Statistics-First Engine) - NO SKIP
+# bot.py — FTW VIP PREDICTOR (HYPER V17 — Statistics-First Engine) - NO SKIP + DUP FIX
 # Python 3.10+  |  Deps: aiohttp
 
 import asyncio, contextlib, html, json, logging, math, os, random, signal, socket, sqlite3, time
@@ -28,7 +28,6 @@ class Config:
     delivery_ttl: float = 55.0
     name: str = "FTW VIP PREDICTOR (HYPER)"
     
-    # 🔥 NO SKIP FIX: Default 0.0 kar diya hai, taaki har baar prediction aaye
     min_edge: float = float(os.getenv("MIN_EDGE", "0.0"))
     
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
@@ -102,7 +101,6 @@ def weighted_probability(observations):
     probability = (4 + sum(y * w for y, w in observations)) / (8 + sw)
     return probability, effective_n
 
-# 🔥 FIX: Removing MACD/RSI for binary data. Replaced with pure statistical rolling means.
 def trend_features(seq):
     if not seq: return [0.0] * 32
     def mean(k):
@@ -152,6 +150,8 @@ class Database:
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, issue TEXT, text TEXT NOT NULL, created REAL NOT NULL, expires REAL, sent INTEGER NOT NULL DEFAULT 0);
         """)
+        # 🔥 FIX: If bot crashed while sending, reset to 0 so it retries
+        self.c.execute("UPDATE outbox SET sent=0 WHERE sent=3")
 
     @contextmanager
     def transaction(self):
@@ -219,10 +219,10 @@ class Database:
             weight *= 0.5
         return clip(p), weight, flipped
 
-    # 🔥 FIX: Added duplicate check for predictions to stop double messaging
+    # 🔥 FIX: Check if prediction already exists in queue (sent=0,1,3)
     def queue(self, kind, issue, text, expires=None):
         if kind == "prediction" and issue:
-            exists = self.c.execute("SELECT 1 FROM outbox WHERE kind='prediction' AND issue=? AND sent IN (0,1)", (issue,)).fetchone()
+            exists = self.c.execute("SELECT 1 FROM outbox WHERE kind='prediction' AND issue=? AND sent IN (0,1,3)", (issue,)).fetchone()
             if exists: return
         self.c.execute("INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)",
                        (kind, issue, text, time.time(), expires))
@@ -398,7 +398,7 @@ class Engine:
                 elif won_side: sticker = CFG.win_sticker
                 else: sticker = CFG.loss_sticker
                 self.db.queue("sticker", row["issue"], sticker)
-                self.db.c.execute("UPDATE outbox SET sent=2 WHERE kind='prediction' AND issue=? AND sent=0", (row["issue"],))
+                self.db.c.execute("UPDATE outbox SET sent=2 WHERE kind='prediction' AND issue=? AND sent IN (0,3)", (row["issue"],))
 
 
 def _pattern_str(patterns):
@@ -406,7 +406,6 @@ def _pattern_str(patterns):
     top = patterns[0]; p_type = top[4].split(":")[0]; bits = top[4].split(":")[-1]
     arrow = "⬆️" if top[1] >= 0.5 else "⬇️"
     return f"👨‍👩‍👧‍👦 <code>{bits}</code> {arrow}" if p_type == "family" else f"<code>{bits}</code> {arrow}"
-
 
 # ─── UPGRADED ENGINE (V17) ──────────────────────────────────
 class UpgradedEngine(Engine):
@@ -509,8 +508,6 @@ class UpgradedEngine(Engine):
         edge = abs(p_cal - 0.5)
         confidence = max(p_cal, 1 - p_cal)
 
-        # 🔥 NO SKIP: The return None block is removed. It will always output a prediction.
-
         return {
             "issue": issue, "p": p_cal, "p_raw": p_raw, "side": pred_side,
             "num": best_num, "num_probability": num_prob, "change_score": change_score,
@@ -520,7 +517,6 @@ class UpgradedEngine(Engine):
             "experts": experts, "features": features, "meta_feats": m_feats,
             "patterns": [{"key": k, "p": p, "support": s} for r, p, s, e, k in patterns]
         }
-
 
 # ─── FORMATTER ──────────────────────────────────────────────
 def format_prediction(p):
@@ -547,7 +543,6 @@ def format_prediction(p):
         f"━━━━━━━━━━━━━━━━━━"
     )
 
-
 # ─── RUNTIME ──────────────────────────────────────────────
 class Runtime:
     def __init__(self, db):
@@ -556,6 +551,7 @@ class Runtime:
         self.stop = asyncio.Event()
         self.last_fetch = 0.0
         self.error = None
+        self.sent_predictions = set() # 🔥 IN-MEMORY LOCK
 
     async def pause(self, seconds):
         try: await asyncio.wait_for(self.stop.wait(), timeout=max(0.05, seconds))
@@ -596,7 +592,6 @@ class Runtime:
                     if not exists:
                         p = self.engine.predict(history, issue)
                         with self.db.transaction():
-                            # 🔥 NO SKIP FIX: Predict always returns valid data now
                             if p is not None:
                                 cursor = self.db.c.execute("INSERT OR IGNORE INTO predictions VALUES (?,?,?,?,NULL)",
                                                   (issue, time.time(), "PENDING", json.dumps(p)))
@@ -615,35 +610,60 @@ class Runtime:
         backoff = 1.0
         while not self.stop.is_set():
             self.db.c.execute("UPDATE outbox SET sent=2 WHERE sent=0 AND expires <= ?", (time.time(),))
+            
+            # Pick next message to send
             row = self.db.c.execute("SELECT * FROM outbox WHERE sent=0 ORDER BY id ASC LIMIT 1").fetchone()
             if not row:
                 await self.pause(0.5); continue
+                
+            # 🔥 TRIPLE LOCK: Prevent double message if exists in memory
+            if row["kind"] == "prediction" and row["issue"] in self.sent_predictions:
+                self.db.c.execute("UPDATE outbox SET sent=1 WHERE id=?", (row["id"],))
+                continue
+                
+            # 🔥 TRIPLE LOCK: Mark as "sending" (3) in DB instantly
+            self.db.c.execute("UPDATE outbox SET sent=3 WHERE id=?", (row["id"],))
+            
             delay = backoff
             try:
                 if row["kind"] == "sticker":
                     url = endpoint_sticker; payload = {"chat_id": CFG.chat, "sticker": row["text"]}
                 else:
                     url = endpoint_msg; payload = {"chat_id": CFG.chat, "text": row["text"], "parse_mode": "HTML"}
-                async with session.post(url, json=payload) as response:
+                
+                # Set a strict 10 second timeout for telegram API
+                async with session.post(url, json=payload, timeout=10) as response:
                     data = await response.json(content_type=None)
                     if response.status == 200 and data.get("ok"):
                         self.db.c.execute("UPDATE outbox SET sent=1 WHERE id=?", (row["id"],))
+                        if row["kind"] == "prediction":
+                            self.sent_predictions.add(row["issue"])
                         backoff = 1.0; continue
+                    
                     code = data.get("error_code", response.status)
-                    if code == 429: delay = float(data.get("parameters", {}).get("retry_after", 10))
+                    if code == 429: 
+                        delay = float(data.get("parameters", {}).get("retry_after", 10))
+                        self.db.c.execute("UPDATE outbox SET sent=0 WHERE id=?", (row["id"],)) 
                     elif code in (400, 401, 403, 404):
                         delay = 60
+                        self.db.c.execute("UPDATE outbox SET sent=2 WHERE id=?", (row["id"],)) 
                         if code == 400 and row["kind"] == "sticker":
                             LOG.error(f"Invalid Sticker ID: {row['text']}")
-                            self.db.c.execute("UPDATE outbox SET sent=2 WHERE id=?", (row["id"],)); continue
+                    else:
+                        self.db.c.execute("UPDATE outbox SET sent=2 WHERE id=?", (row["id"],))
             except asyncio.CancelledError: raise
-            except Exception as e: LOG.warning(f"Telegram fail: {e}")
+            except Exception as e: 
+                LOG.warning(f"Telegram fail: {e}")
+                # 🔥 If prediction fails due to timeout/network, DROP IT to prevent double send
+                if row["kind"] == "prediction":
+                    self.db.c.execute("UPDATE outbox SET sent=2 WHERE id=?", (row["id"],))
+                else:
+                    self.db.c.execute("UPDATE outbox SET sent=0 WHERE id=?", (row["id"],)) 
             await self.pause(delay); backoff = min(60.0, backoff * 2)
 
     async def health(self, request):
         total = self.db.c.execute("SELECT COUNT(*) FROM predictions WHERE status IN ('WIN','LOSS')").fetchone()[0]
         wins = self.db.c.execute("SELECT COUNT(*) FROM predictions WHERE status='WIN'").fetchone()[0]
-        # Skips will be 0 now, but keeping the endpoint safe
         skips = self.db.c.execute("SELECT COUNT(*) FROM predictions WHERE status='SKIP'").fetchone()[0]
         acc = (wins / total * 100) if total else 0.0
         return web.json_response({
@@ -651,7 +671,6 @@ class Runtime:
             "history": self.db.c.execute("SELECT COUNT(*) FROM history").fetchone()[0],
             "settled": total, "wins": wins, "win_rate": f"{acc:.1f}%", "skipped": skips,
         })
-
 
 # ─── MAIN ──────────────────────────────────────────────────
 async def main():
@@ -673,7 +692,7 @@ async def main():
             tasks = [asyncio.create_task(runtime.worker(session), name="worker"),
                      asyncio.create_task(runtime.sender(session), name="sender")]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info(f"{CFG.name} V17 Started (Statistics-First Engine, NO SKIP)")
+            LOG.info(f"{CFG.name} V17 Started (Strict No-Duplicate Mode)")
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
             for task in tasks:
