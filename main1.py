@@ -1,5 +1,5 @@
 """
-FTW Predictor V50 — APEX ENSEMBLE (bias-corrected)
+FTW Predictor V50.1 — APEX ENSEMBLE (bias-corrected, no-skip)
 Python 3.10+ | Deps: aiohttp
 """
 
@@ -42,15 +42,12 @@ class Config:
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 18.0
     max_history: int = 3500
-    min_history: int = int(os.getenv("MIN_HISTORY", "180"))
+    min_history: int = int(os.getenv("MIN_HISTORY", "120"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
     delivery_ttl: float = 600.0
-    # V50 additions
-    min_confidence: float = float(os.getenv("MIN_CONFIDENCE", "0.54"))       # skip below this
-    bias_guard_window: int = int(os.getenv("BIAS_GUARD_WINDOW", "15"))       # last N preds
-    bias_guard_ratio: float = float(os.getenv("BIAS_GUARD_RATIO", "0.78"))   # if >78% same side…
-    bias_guard_extra_conf: float = float(os.getenv("BIAS_GUARD_EXTRA_CONF", "0.05"))  # …require +5% conf
-    name: str = "FTW PREDICTOR (V50 APEX)"
+    bias_guard_window: int = int(os.getenv("BIAS_GUARD_WINDOW", "15"))
+    bias_guard_ratio: float = float(os.getenv("BIAS_GUARD_RATIO", "0.85"))
+    name: str = "FTW PREDICTOR (V50.1 APEX)"
 
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
@@ -68,7 +65,7 @@ CFG = Config()
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-LOG = logging.getLogger("predictor_v50")
+LOG = logging.getLogger("predictor_v50_1")
 
 # ============================================================
 # HELPERS
@@ -118,7 +115,7 @@ def get_regime(seq: list[int]) -> str:
     return "MIXED"
 
 def entropy_bits(seq: list[int]) -> float:
-    """For binary {0,1}, max = 1.0 bit. Return raw 0..1 (no /3.32!)."""
+    """Binary entropy, 0..1. No /3.32 — that was a V49 bug."""
     if not seq: return 0.0
     c = Counter(seq)
     n = len(seq)
@@ -171,9 +168,11 @@ class BetaTracker:
         self.beta = self.beta * self.decay + (0.0 if won else 1.0)
 
     @property
-    def mean(self) -> float: return self.alpha / (self.alpha + self.beta)
+    def mean(self) -> float:
+        return self.alpha / (self.alpha + self.beta)
 
-    def to_dict(self) -> dict[str, float]: return {"a": self.alpha, "b": self.beta}
+    def to_dict(self) -> dict[str, float]:
+        return {"a": self.alpha, "b": self.beta}
 
     @classmethod
     def from_dict(cls, d: dict[str, float] | None, decay: float = 0.985) -> "BetaTracker":
@@ -188,7 +187,7 @@ class BetaTracker:
 class Signal:
     name: str
     side: str
-    strength: float     # P(predicted_side) in [0.5, 1.0]
+    strength: float
     weight: float
     reason: str = ""
     detail: str = ""
@@ -199,7 +198,7 @@ class Signal:
         return s if self.side == "BIG" else -s
 
 # ============================================================
-# SIGNAL PRODUCERS (all symmetric — verified)
+# SIGNAL PRODUCERS
 # ============================================================
 
 def signal_family_pattern(seq: list[int], db: "Database", regime: str) -> Signal | None:
@@ -298,19 +297,14 @@ def signal_trend(seq: list[int]) -> Signal | None:
     )
 
 def signal_streak_break(seq: list[int]) -> Signal | None:
-    """
-    Proper survival analysis:
-    continues = # historical runs that reached `run + 1`
-    breaks    = # historical runs that ended exactly at `run`
-    p_continue = continues / (continues + breaks)
-    """
+    """Proper survival analysis (V49 bug fixed)."""
     if len(seq) < 80: return None
     cur = seq[-1]
     run = 1
     for v in reversed(seq[:-1]):
         if v == cur: run += 1
         else: break
-    if run < 2: return None  # too short to reason about
+    if run < 2: return None
 
     continues = 0
     breaks = 0
@@ -318,21 +312,18 @@ def signal_streak_break(seq: list[int]) -> Signal | None:
     for i in range(1, len(seq)):
         if seq[i] == seq[i - 1]:
             streak += 1
-            if streak == run + 1:      # crossed from run → run+1
+            if streak == run + 1:
                 continues += 1
         else:
-            if streak == run:           # ended exactly at run
+            if streak == run:
                 breaks += 1
             streak = 1
-    # (the current run is excluded — it hasn't ended yet)
 
     total = continues + breaks
     if total < 5: return None
     p_continue = continues / total
     if abs(p_continue - 0.5) < 0.10: return None
 
-    # p_continue >= 0.5 → extend current streak
-    # p_continue <  0.5 → break current streak (predict opposite)
     side_val = cur if p_continue >= 0.5 else (1 - cur)
     return Signal(
         name="streak_break",
@@ -344,21 +335,21 @@ def signal_streak_break(seq: list[int]) -> Signal | None:
     )
 
 def signal_cusum(seq: list[int], thr: float = 3.0) -> Signal | None:
-    """Contrarian: fires when a sustained one-sided drift is detected."""
+    """Contrarian: fires on sustained one-sided drift."""
     if len(seq) < 25: return None
     sp, sn = 0.0, 0.0
     for v in seq[-30:]:
-        sp = max(0.0, sp + (v - 0.5) - 0.15)   # drift up (BIG streak)
-        sn = min(0.0, sn + (v - 0.5) + 0.15)   # drift down (SMALL streak)
+        sp = max(0.0, sp + (v - 0.5) - 0.15)
+        sn = min(0.0, sn + (v - 0.5) + 0.15)
     if sp > thr:
         return Signal(
-            name="cusum", side="SMALL",     # revert from BIG streak
+            name="cusum", side="SMALL",
             strength=clip(0.50 + min(0.20, sp / 25.0), 0.5, 0.70),
             weight=0.75, reason=f"CUSUM up (revert) sp={sp:.1f}", detail=f"sp={sp:.1f}",
         )
     if sn < -thr:
         return Signal(
-            name="cusum", side="BIG",       # revert from SMALL streak
+            name="cusum", side="BIG",
             strength=clip(0.50 + min(0.20, abs(sn) / 25.0), 0.5, 0.70),
             weight=0.75, reason=f"CUSUM down (revert) sn={sn:.1f}", detail=f"sn={sn:.1f}",
         )
@@ -528,7 +519,6 @@ class Database:
         self.c.execute("INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)",
                        (kind, issue, text, time.time(), expires))
 
-    # ---------- diagnostics ----------
     def data_side_stats(self, last_n: int = 50) -> dict[str, Any]:
         rows = self.c.execute(
             "SELECT num FROM history ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?", (last_n,)
@@ -560,7 +550,7 @@ class Database:
             won = 1.0 if r["status"] == "WIN" else 0.0
             brier += (p - won) ** 2
             b = round(p * 10) / 10
-            buckets[b][0] += won      # FIX: accumulate actual WIN, not p
+            buckets[b][0] += won
             buckets[b][1] += 1
         return {
             "n": n,
@@ -630,25 +620,30 @@ class Engine:
                 LOG.warning("signal failed: %s", exc)
         return sigs
 
-    def _bias_guard(self, side: str, confidence: float) -> tuple[bool, str]:
-        """Reject if recent predictions too one-sided AND confidence not high enough."""
+    def _bias_info(self, side: str) -> dict[str, Any]:
+        """Diagnostic only — never rejects."""
         recent = self.db.recent_side_calls(CFG.bias_guard_window)
         if recent["window"] < 8:
-            return True, ""
+            return {"flag": False, "window": recent["window"],
+                    "big": recent["BIG"], "small": recent["SMALL"]}
         frac = recent[side] / max(1, recent["window"])
-        if frac < CFG.bias_guard_ratio:
-            return True, ""
-        # require extra confidence on the crowded side
-        threshold = CFG.min_confidence + CFG.bias_guard_extra_conf
-        if confidence < threshold:
-            return False, f"bias_guard: {side} {recent[side]}/{recent['window']} recent, conf {confidence:.3f} < {threshold:.3f}"
-        return True, f"bias_guard: {side} crowded but conf={confidence:.3f} cleared"
+        flagged = frac >= CFG.bias_guard_ratio
+        if flagged:
+            LOG.warning("bias info: %s crowded %d/%d recent",
+                        side, recent[side], recent["window"])
+        return {
+            "flag": flagged,
+            "window": recent["window"],
+            "big": recent["BIG"],
+            "small": recent["SMALL"],
+            "crowded": side if flagged else None,
+        }
 
-    def predict(self, history: list[dict[str, Any]], issue: str) -> dict[str, Any] | None:
+    def predict(self, history: list[dict[str, Any]], issue: str) -> dict[str, Any]:
         seq = [int(r["size"]) for r in history]
         nums = [int(r["num"]) for r in history]
         regime = get_regime(seq)
-        entropy = entropy_bits(seq[-24:])          # FIX: raw binary entropy (0..1)
+        entropy = entropy_bits(seq[-24:])
 
         signals = self._collect_signals(seq, nums, regime)
         weighted: list[Signal] = []
@@ -659,13 +654,11 @@ class Engine:
 
         total_vote = sum(s.vote for s in weighted)
         total_weight = sum(s.weight for s in weighted) or 1.0
-        # FIX: 4.0 → 2.0 (was massively over-confident)
         raw_p_big = sigmoid((total_vote / max(1.0, total_weight)) * 2.0)
 
-        if entropy > 0.85:                          # FIX: damping now actually fires
+        if entropy > 0.85:
             raw_p_big = 0.5 + (raw_p_big - 0.5) * 0.55
 
-        # Calibration shrink toward observed hit-rate
         calib = self.db.calibration_summary()
         if calib.get("n", 0) >= 30:
             conf = max(raw_p_big, 1 - raw_p_big)
@@ -675,22 +668,15 @@ class Engine:
                 conf = 0.5 * conf + 0.5 * float(observed)
                 raw_p_big = conf if raw_p_big >= 0.5 else 1 - conf
 
+        # Tie-breaker: near-coinflip → nudge by opposite of last result (anti-stall)
+        if 0.485 <= raw_p_big <= 0.515 and seq:
+            raw_p_big = 0.52 if seq[-1] == 0 else 0.48
+
         side = "BIG" if raw_p_big >= 0.5 else "SMALL"
         side_p = clip(raw_p_big if side == "BIG" else 1 - raw_p_big)
 
-        # Min-confidence gate
-        if side_p < CFG.min_confidence:
-            LOG.info("skip %s: conf %.3f < %.3f", issue, side_p, CFG.min_confidence)
-            return None
+        bias = self._bias_info(side)
 
-        # Bias guard
-        ok, why = self._bias_guard(side, side_p)
-        if not ok:
-            LOG.info("skip %s: %s", issue, why)
-            return None
-        if why: LOG.info(why)
-
-        # Number
         num_dist, num_info = track_numbers(nums)
         allowed = range(5, 10) if side == "BIG" else range(0, 5)
         filtered = [num_dist[k] * (1.6 if k in allowed else 0.08) for k in range(10)]
@@ -701,7 +687,7 @@ class Engine:
         top3 = sorted(allowed, key=lambda k: filtered[k], reverse=True)[:3]
 
         dominant = max(weighted, key=lambda s: abs(s.vote)) if weighted else None
-        payload = {
+        return {
             "issue": issue,
             "p": side_p,
             "side": side,
@@ -719,10 +705,10 @@ class Engine:
             "num_tracking": num_info.get("model", "—"),
             "override_reason": dominant.reason if dominant else "ensemble",
             "data_last_50_big_pct": self.db.data_side_stats(50).get("big_pct"),
-            "source": "V50 Apex Ensemble",
+            "bias": bias,
+            "source": "V50.1 Apex Ensemble",
             "created": time.time(),
         }
-        return payload
 
     def settle(self, history: list[dict[str, Any]]) -> None:
         lookup = {r["issue"]: r for r in history}
@@ -745,7 +731,6 @@ class Engine:
                 for s in payload.get("signals", []):
                     s_side = s["side"]
                     s_str = float(s["str"])
-                    # FIX: convert strength → P(BIG) before pattern learning
                     p_big = s_str if s_side == "BIG" else (1 - s_str)
                     if s["n"].startswith("family") or s["n"].startswith("skipgram"):
                         self.db.learn_pattern(s["n"], p_big, actual_size)
@@ -779,6 +764,15 @@ def format_prediction(payload: dict[str, Any]) -> str:
 
     n1 = int(payload["number"]); top3 = payload.get("top3", [n1])
     nconf = payload.get("num_conf", 0) * 100
+
+    bias = payload.get("bias", {})
+    bias_line = ""
+    if bias.get("flag"):
+        crowded = bias.get("crowded") or side
+        crowded_n = bias.get(crowded.lower(), 0)
+        bias_line = (f"\n⚠️ <b>BIAS TAG:</b> {escape(crowded)} "
+                     f"{crowded_n}/{bias.get('window', 0)} recent")
+
     return (
         f"⚡ <b>{escape(CFG.name)}</b> ⚡\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -791,7 +785,8 @@ def format_prediction(payload: dict[str, Any]) -> str:
         f"📊 <b>CONF:</b> {conf:.1f}% [{bar}]\n"
         f"🌊 <b>REGIME:</b> {escape(payload['regime'])} · ent={payload.get('entropy','?')}\n"
         f"🗳️ <b>VOTES:</b> BIG[{vote_big}] / SMALL[{vote_small}] · "
-        f"Σ=<code>{payload.get('vote_sum', 0):+.2f}</code>\n"
+        f"Σ=<code>{payload.get('vote_sum', 0):+.2f}</code>"
+        f"{bias_line}\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"🧠 <b>SIGNALS:</b>\n{sig_block}\n"
         "━━━━━━━━━━━━━━━━━━"
@@ -833,17 +828,19 @@ class Runtime:
 
                 if len(history) >= CFG.min_history:
                     issue = str(int(history[-1]["issue"]) + 1)
-                    if not self.db.c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone():
+                    if not self.db.c.execute(
+                        "SELECT 1 FROM predictions WHERE issue=?", (issue,)
+                    ).fetchone():
                         pred = self.engine.predict(history, issue)
-                        if pred is not None:
-                            with self.db.transaction():
-                                self.db.c.execute(
-                                    "INSERT INTO predictions(issue,created,status,payload,predicted_p) "
-                                    "VALUES (?,?,?,?,?)",
-                                    (issue, time.time(), "PENDING", json.dumps(pred), float(pred["p"])),
-                                )
-                                self.db.queue("prediction", issue, format_prediction(pred),
-                                              time.time() + CFG.delivery_ttl)
+                        with self.db.transaction():
+                            self.db.c.execute(
+                                "INSERT INTO predictions(issue,created,status,payload,predicted_p) "
+                                "VALUES (?,?,?,?,?)",
+                                (issue, time.time(), "PENDING",
+                                 json.dumps(pred), float(pred["p"])),
+                            )
+                            self.db.queue("prediction", issue, format_prediction(pred),
+                                          time.time() + CFG.delivery_ttl)
                 failures = 0
             except asyncio.CancelledError: raise
             except Exception:
