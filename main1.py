@@ -37,7 +37,7 @@ class Config:
     token: str = os.getenv("TELEGRAM_TOKEN", "9279667822:AAEfV9c7yOhYExvtr8lrnEdqQZGvs8wieWQ")
     chat: str = os.getenv("TELEGRAM_CHAT", "-1004368817214")
     urls_raw: str = os.getenv("HISTORY_URLS", DEFAULT_HISTORY_URL)
-    db_path: str = os.getenv("DB_PATH", "predictor1_v50_apex.db")
+    db_path: str = os.getenv("DB_PATH", "predictor11_v50_apex.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 18.0
